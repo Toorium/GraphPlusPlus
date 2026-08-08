@@ -1,0 +1,129 @@
+"""Velocity/Acceleration overlay drawn inside the Graph Editor.
+
+Adds a small panel at the bottom of the graph editor showing the speed
+and acceleration of the active object's motion, derived from its sampled
+world-space path. This gives animators a quick visual sense of how the
+object is moving without having to interpret 3 separate FCurve channels.
+"""
+import bpy
+import gpu
+from gpu_extras.batch import batch_for_shader
+
+from ..utils import PALETTE, velocity_color
+from ..core.path_sampler import sample_object_path
+from ..core.velocity import compute_speed_series, compute_acceleration_series
+
+
+_DRAW_HANDLER = None
+
+
+def _draw_overlay():
+    """Draw a small velocity/acceleration mini-graph at the bottom of the graph editor."""
+    context = bpy.context
+    obj = context.active_object
+    if obj is None:
+        return
+
+    # Only draw if Graph++ is enabled on this object
+    from ..motion_path.multi_object import is_enabled
+    if not is_enabled(obj):
+        return
+
+    # Sample the path
+    try:
+        path = sample_object_path(obj, samples_per_segment=4)
+    except Exception:
+        return
+
+    if len(path) < 2:
+        return
+
+    speed = compute_speed_series(path)
+    accel = compute_acceleration_series(path)
+
+    # Get graph editor region
+    region = context.region
+    region_3d = context.space_data.region_3d
+    if region is None or region.type != 'WINDOW':
+        return
+
+    # Draw a small overlay at the bottom-right of the region
+    # We use screen-space coordinates (region-relative)
+    w = region.width
+    h = region.height
+
+    panel_w = min(280, w - 40)
+    panel_h = 80
+    panel_x = w - panel_w - 20
+    panel_y = 20
+
+    # Background quad
+    bg_verts = [
+        (panel_x, panel_y),
+        (panel_x + panel_w, panel_y),
+        (panel_x + panel_w, panel_y + panel_h),
+        (panel_x, panel_y + panel_h),
+    ]
+    bg_indices = [(0, 1, 2), (0, 2, 3)]
+
+    shader_uni = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    # Use a 2D shader for screen-space drawing
+    from gpu_extras.batch import batch_for_shader
+    bg_batch = batch_for_shader(shader_uni, 'TRIS', {"pos": bg_verts}, indices=bg_indices)
+    shader_uni.uniform_float("color", (*PALETTE["ui_bg"], 0.85))
+    bg_batch.draw()
+
+    # Plot speed as a colored line graph
+    if speed:
+        max_speed = max((v for _, v in speed), default=1.0) or 1.0
+        verts = []
+        colors = []
+        for i, (frame, v) in enumerate(speed):
+            t = i / max(1, len(speed) - 1)
+            x = panel_x + 10 + t * (panel_w - 20)
+            normalized = v / max_speed
+            y = panel_y + 10 + normalized * (panel_h - 20)
+            verts.append((x, y))
+            c = velocity_color(normalized)
+            colors.append((*c, 1.0))
+
+        if len(verts) >= 2:
+            shader_smooth = gpu.shader.from_builtin('SMOOTH_COLOR')
+            line_batch = batch_for_shader(shader_smooth, 'LINE_STRIP', {"pos": verts, "color": colors})
+            line_batch.draw()
+
+    # Plot acceleration as a thin overlay (use a different color)
+    if accel:
+        max_a = max((abs(v) for _, v in accel), default=1.0) or 1.0
+        verts = []
+        for i, (frame, v) in enumerate(accel):
+            t = i / max(1, len(accel) - 1)
+            x = panel_x + 10 + t * (panel_w - 20)
+            normalized = v / max_a
+            y = panel_y + panel_h / 2 + normalized * (panel_h / 2 - 10)
+            verts.append((x, y))
+
+        if len(verts) >= 2:
+            shader_uni2 = gpu.shader.from_builtin('UNIFORM_COLOR')
+            accel_batch = batch_for_shader(shader_uni2, 'LINE_STRIP', {"pos": verts})
+            shader_uni2.uniform_float("color", (*PALETTE["accent_dim"], 0.6))
+            accel_batch.draw()
+
+
+def register():
+    global _DRAW_HANDLER
+    if _DRAW_HANDLER is None:
+        _DRAW_HANDLER = bpy.types.SpaceGraphEditor.draw_handler_add(
+            _draw_overlay, (), 'WINDOW', 'POST_PIXEL'
+        )
+
+
+def unregister():
+    global _DRAW_HANDLER
+    if _DRAW_HANDLER is not None:
+        try:
+            bpy.types.SpaceGraphEditor.draw_handler_remove(_DRAW_HANDLER, 'WINDOW')
+        except Exception:
+            pass
+        _DRAW_HANDLER = None
